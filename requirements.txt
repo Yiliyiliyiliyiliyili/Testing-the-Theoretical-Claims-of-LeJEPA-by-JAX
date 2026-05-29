@@ -1,0 +1,8 @@
+equinox
+optax
+jax[cuda12]
+tensorflow
+tensorflow-datasets
+numpy
+matplotlib
+pandas
