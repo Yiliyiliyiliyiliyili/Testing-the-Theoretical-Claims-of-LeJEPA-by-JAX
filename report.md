@@ -264,7 +264,7 @@ LeJEPA outperforms VICReg when λ is large enough to prevent collapse. The 5–7
 
 **Single seed.** The stochastic collapse escape at λ=0.05 shows that some conditions are sensitive to the specific gradient trajectory. Without multiple seeds, the variance of results cannot be quantified.
 
-**Directions for improvement:** extending training to 50000–100000 steps; running 3+ seeds per condition; adding λ=0.25 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
+**Directions for improvement:** extending training to 50000–100000 steps; running 3+ seeds per condition; adding λ=0.25, 0.75 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
 
 ---
 
