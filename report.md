@@ -263,9 +263,9 @@ LeJEPA outperforms VICReg when λ is large enough to prevent collapse. The 5–7
 
 **Insufficient training steps.** 20000 steps corresponds to ~200 epochs — well below the 800–1000 epochs at which SSL models typically converge. The λ=0.5 accuracy advantage and the ordering of conditions may reflect convergence speed rather than final performance.
 
-**Invariance loss scale confound.** PureSIG's invariance loss (~3) cannot be directly compared to main experiment values (~0.005–0.024) due to the scale effect of emb_var >> 1. L2-normalizing embeddings before computing invariance would enable a fair comparison.
+**Single seed.** The stochastic collapse escape at λ=0.05 shows that some conditions are sensitive to the specific gradient trajectory. Without multiple seeds, the variance of results cannot be quantified.
 
-**Directions for improvement:** extending training to 50000–100000 steps; adding λ=0.25 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
+**Directions for improvement:** extending training to 50000–100000 steps; running 3+ seeds per condition; adding λ=0.25 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
 
 ---
 
