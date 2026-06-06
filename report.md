@@ -219,7 +219,13 @@ Together these conditions confirm that both terms are necessary: regularization 
 
 **LeJEPA λ=0.5** showed the highest initial invariance loss among stable conditions (~0.055 at step 100), reflecting the strong SIGReg pressure that initially dominates training and deprioritizes view alignment. The invariance loss then declined to ~0.014 and the gradient ratio stabilized near 0.74 — meaning by the end of training SIGReg's raw gradient was actually weaker than invariance, yet λ=0.5 kept it as the dominant effective contributor. SIGReg loss reached the lowest final value (0.009).
 
-The final gradient ratios form a monotone decreasing sequence with λ, confirming that higher λ produces stronger regularization pressure at every point in training, not just through explicit weighting.
+The final gradient ratios form a monotone decreasing sequence with λ, confirming that higher λ produces stronger regularization pressure at every point in training, not just through explicit weighting:
+| Condition | Grad Ratio (final) | Effective SIGReg contribution (grad ratio * λ) |
+|-----------|-------------------|-----------------------------------------|
+| LeJEPA λ=0.01 | 6.20 | ~6% of Inv |
+| LeJEPA λ=0.05 | 11.71 | ~59% of Inv |
+| LeJEPA λ=0.1 | 1.40 | ~14% of Inv |
+| LeJEPA λ=0.5 | 0.74 | ~37% of Inv |
 
 ### 3.3 Linear Probe Results
 
