@@ -68,7 +68,7 @@ Stage1: ResBlock(64→64,   stride=1) × 2
 Stage2: ResBlock(64→128,  stride=2) × 2   [32→16]
 Stage3: ResBlock(128→256, stride=2) × 2   [16→8]
 Stage4: ResBlock(256→512, stride=2) × 2   [8→4]
-GlobalAvgPool → ProjMLP: 512→512→512→64
+GlobalAvgPool → (512,)
 ```
 
 **InstanceNorm instead of BatchNorm.** BatchNorm maintains running statistics across batches — mutable state that is incompatible with JAX's functional programming model, where functions must be pure (no side effects). InstanceNorm normalizes each feature map independently over its spatial dimensions within a single sample, requiring no batch-level bookkeeping. This makes the model a pure function: given the same input and weights, it always produces the same output, which is required for JAX's JIT compilation and automatic differentiation.
@@ -86,8 +86,6 @@ The model exposes two forward methods: `encode()` returns the 512-dim backbone f
 These transforms compose cleanly and require functions to be pure, which motivated the choice of InstanceNorm and the functional training loop design.
 
 **Equinox** is a JAX-based neural network library that represents models as pytrees of arrays — pure data structures with no hidden state. This makes models composable with all JAX transforms naturally.
-
-**tf.data instead of PyTorch DataLoader.** The standard PyTorch DataLoader with `num_workers > 0` uses `os.fork()` to spawn worker processes. JAX initializes a multithreaded CUDA context at import time, and forking a multithreaded process produces undefined behavior — in practice, a deadlock. The `tf.data` pipeline performs all data loading and augmentation in TensorFlow's C++ runtime, which does not share JAX's threading constraints. The `prefetch(AUTOTUNE)` call overlaps CPU data preparation with GPU computation, achieving the same throughput benefit as multiple DataLoader workers without any fork-related issues.
 
 ### 1.8 AdamW and Warmup Cosine Decay
 
@@ -110,24 +108,65 @@ The warmup phase is important for SSL training: in the first steps, embeddings a
 
 The guiding principle is **simplicity**: use the smallest, fastest components that can clearly answer the research questions. Every design choice prioritizes interpretability of results over absolute performance.
 
-The full pipeline:
+**SSL Training Pipeline**
 
 ```
-CIFAR-10 image
-    ↓  × 4 independent augmentations
-(N, V=4, 3, 32, 32) batch
-    ↓  jax.vmap(model)
-(V, N, D=64) projected embeddings z
-    ↓
-SSL Loss: λ × SIGReg(z) + (1−λ) × Invariance(z)   [LeJEPA]
-          α × Var + β × Inv + γ × Cov               [VICReg]
-    ↓  AdamW + warmup cosine decay
-updated model parameters
+CIFAR-10 images
+    └─ SimCLR augmentation × 4 views              (N, 4, 3, 32, 32)
+        └─ MiniResNet-18 backbone
+           in : (3, 32, 32) per image
+           out: (512,) per image
+                └─ Projection Head  MLP 512→512→512→64
+                   in : (512,)
+                   out: (64,)
+                        └─ Embeddings              (4, N, 64)
+                            └─ SSL Loss (VICReg or LeJEPA)
+                                └─ AdamW + warmup cosine decay
+                                   (500-step warmup, lr 0→1e-3→1e-5)
 ```
 
-V=4 views per image provides C(4,2)=6 view pairs for the invariance term, giving a more stable gradient estimate than the standard V=2 used in the original papers.
+V=4 views per image provides C(4,2)=6 view pairs for the invariance term,
+giving a more stable gradient estimate than the standard V=2 used in the
+original papers.
 
-### 2.2 Experimental Conditions
+**Linear Probe Evaluation Pipeline**
+
+```
+CIFAR-10 images
+    └─ Normalize only, no augmentation                 (N, 3, 32, 32)
+        └─ MiniResNet-18 backbone (frozen weights)
+           in : (3, 32, 32) per image
+           out: (512,) per image
+                └─ Pre-extracted feature matrix        (N, 512)
+                    └─ LinearProbe  512→10
+                       trained 100 epochs, AdamW
+                            └─ Top-1 test accuracy on CIFAR-10
+```
+
+The projection head is discarded at evaluation time. The backbone's 512-dim
+output is used instead, following the standard SSL evaluation protocol:
+the projection head is a task-specific adapter optimized for the SSL loss
+geometry, while the backbone features reflect what the encoder has genuinely
+learned about the visual content of the images.
+
+### 2.2 Evaluation Metrics
+
+Four metrics are recorded every 100 steps during training, plus a final linear probe after training completes.
+
+| Metric | What it measures | What to look for |
+|--------|-----------------|-----------------|
+| SIGReg loss | Distance from embedding distribution to N(0,1) | Lower = more Gaussian distribution |
+| Invariance loss | Mean MSE between different views of the same image | Lower = better view alignment |
+| Embedding variance | Mean variance per embedding dimension | Near 0 = collapse; near 1 = healthy |
+| Gradient ratio | ‖∂SIGReg/∂θ‖ / ‖∂Inv/∂θ‖ (no λ scaling) | Quantifies natural scale competition |
+
+SIGReg loss is applied to **all conditions** including VICReg as a unified evaluation metric, even though VICReg never optimizes it directly. This design choice is critical: it allows all conditions to be compared on the same scale. If each condition were evaluated by its own training loss, the numbers would be incomparable.
+
+The gradient ratio is computed without λ scaling to reveal the natural scale relationship between the two loss terms, separate from the weighting imposed by λ. A ratio of 10 means SIGReg's gradient is 10× stronger than Invariance's before any scaling. This quantifies the paper's claim that SIGReg acts as a "guard" — strong when the distribution is disordered, receding as it approaches Gaussian.
+
+**Linear probe accuracy** is the final downstream evaluation, measuring the real-world utility of the learned representations on CIFAR-10 classification.
+
+### 2.3 Experimental Conditions
 
 Conditions are split into two groups to keep the main experiment plots readable. PureInv and PureSIG produce extreme values (emb_var → 0 or >> 1) that would compress the y-axis and obscure differences between the main conditions.
 
@@ -152,60 +191,35 @@ Conditions are split into two groups to keep the main experiment plots readable.
 
 The four λ values are chosen to sample the key behavioral zones: below the collapse threshold (0.01), at the threshold (0.05), in the stable zone (0.1), and at the edge of over-regularization (0.5). All conditions share the same initial weights (PRNGKey(0)) and optimizer settings, isolating the loss function as the only variable.
 
-### 2.3 Evaluation Criteria
-
-Four metrics are recorded every 100 steps:
-
-| Metric | What it measures | What to look for |
-|--------|-----------------|-----------------|
-| SIGReg loss | Distance from embedding distribution to N(0,1) | Lower = more Gaussian distribution |
-| Invariance loss | Mean MSE between different views of the same image | Lower = better view alignment |
-| Embedding variance | Mean variance per embedding dimension | Near 0 = collapse; near 1 = healthy |
-| Gradient ratio | ‖∂SIGReg/∂θ‖ / ‖∂Inv/∂θ‖ (no λ scaling) | Quantifies natural scale competition |
-
-SIGReg loss is applied to **all conditions** including VICReg as a unified evaluation metric, even though VICReg never optimizes it directly. This design choice is critical: it allows all conditions to be compared on the same scale. If each condition were evaluated by its own training loss, the numbers would be incomparable.
-
-The gradient ratio is computed without λ scaling to reveal the natural scale relationship between the two loss terms — separate from the artificial weighting imposed by λ. A ratio of 10 means SIGReg's gradient is 10× stronger than Invariance's before any scaling.
-
-**Linear probe accuracy** is the final downstream evaluation, measuring the real-world utility of the learned representations on CIFAR-10 classification.
-
 ---
 
 ## 3. Results
 
 ### 3.1 Baseline Group
 
-![Baseline conditions: SIGReg loss and embedding variance](baseline_plot.png)
+![Baseline conditions: SIGReg loss, embedding variance, and invariance loss](baseline_plot.png)
 
-**PureInv** collapsed immediately. Embedding variance reached zero by step 500 and SIGReg loss remained fixed at 0.636 for the full 1000 steps. Without regularization, the minimum of the invariance loss is the trivial solution of mapping everything to a point.
+**PureInv** collapsed immediately. Embedding variance reached zero by step 500, SIGReg loss fixed at 0.636, and invariance loss fixed at 0.000. The zero invariance loss is trivially achieved: when all embeddings collapse to a single point, the distance between any two views is exactly zero. This is the degenerate solution the regularizer exists to prevent.
 
-**PureSIG** showed the opposite extreme. SIGReg loss fell to 0.015, but embedding variance peaked at 7.1 before settling near 1.8. Without an invariance term, embeddings expand freely in all directions to reduce CF distance. The representations are well-distributed but carry no information about which images are similar, making them useless for any downstream task.
+**PureSIG** showed the opposite extreme. SIGReg loss fell to 0.015, but embedding variance peaked at 7.1 before stabilizing near 1.8. The invariance loss peaked at ~13 at step 100 before declining to ~3 by the end of training.
 
-These two conditions confirm that both terms are necessary: regularization without invariance produces meaningless embeddings, and invariance without regularization produces collapsed embeddings.
+Together these conditions confirm that both terms are necessary: regularization without invariance produces embeddings with no semantic structure, and invariance without regularization produces collapsed embeddings.
 
 ### 3.2 Training Dynamics
 
-![Main experiment: SIGReg loss, embedding variance, and gradient ratio](training_curves.png)
+![Main experiment: SIGReg loss, embedding variance, invariance loss, and gradient ratio](training_curves.png)
 
-**VICReg** trained stably throughout. SIGReg loss dropped from 0.636 to 0.011 — the lowest final value among all conditions — and embedding variance stabilized near 1.0. The cosine decay schedule is visible in the continued slow improvement through the later stages of training.
+**VICReg** trained stably throughout. SIGReg loss dropped from 0.636 to 0.011 — the lowest final value among all conditions — and embedding variance stabilized near 1.0. However, the invariance loss (bottom-left panel) tells a different story: starting at ~0.07 and declining only to ~0.025 by step 20000, VICReg consistently has the highest invariance loss among all non-collapsed conditions throughout training. The three-term loss structure creates internal competition between the variance, invariance, and covariance terms, leaving invariance chronically under-optimized relative to LeJEPA's dedicated (1−λ) weighting.
 
-**LeJEPA λ=0.01** collapsed completely and permanently. Embedding variance was zero at every logged step. The gradient ratio oscillated between 10² and 10⁴, reflecting unstable gradient estimates in the collapsed state. After λ=0.01 scaling, SIGReg's effective contribution is approximately 6% of the invariance gradient — too weak to break the collapse attractor.
+**LeJEPA λ=0.01** collapsed completely and permanently. All metrics are fixed throughout: emb_var=0, SIGReg=0.635, invariance loss=0, gradient ratio oscillating between 10² and 10⁴. The zero invariance loss is trivial — a consequence of collapse, not alignment. The gradient ratio never stabilizes, confirming that the collapse state prevents any coherent training signal from establishing itself. After λ=0.01 scaling, SIGReg's effective contribution is approximately 6% of the invariance gradient, insufficient to break the collapse attractor.
 
-**LeJEPA λ=0.05** collapsed for the first 4500 steps before escaping stochastically. During the collapse phase, all metrics were identical to λ=0.01. After escape at ~step 4500, SIGReg loss declined to 0.195 and embedding variance grew to 0.55. The warmup schedule did not reliably prevent collapse at this λ value.
+**LeJEPA λ=0.05** collapsed for the first ~4500 steps, during which invariance loss was trivially zero. At ~step 4500 the model escaped: the invariance loss spiked sharply to ~0.05 — momentarily the highest among all conditions — as embeddings spread out and views became distinguishable for the first time. From that point, the invariance term pulled the loss down to ~0.005. The gradient ratio dropped simultaneously from the 10²–10³ collapse range to ~12, matching the behavior of stable conditions. The spike-then-descent in invariance loss combined with the ratio drop is the clearest visual signature of the escape event.
 
-**LeJEPA λ=0.1** trained stably from step 0. SIGReg loss declined continuously to 0.064 and embedding variance reached 0.84. This condition achieved the lowest invariance loss (0.006) of all LeJEPA conditions, indicating the best view alignment quality.
+**LeJEPA λ=0.1** trained stably from step 0. Invariance loss settled to ~0.007, the lowest sustained value among all non-trivially-zero conditions. The gradient ratio stabilized at ~1.4, meaning SIGReg's raw gradient was only 1.4× the invariance gradient — a balanced competition. SIGReg loss declined continuously to 0.064 and embedding variance reached 0.84.
 
-**LeJEPA λ=0.5** converged fastest. SIGReg loss reached 0.009 by step 19500. However, invariance loss (0.013) was twice that of λ=0.1, indicating that the stronger regularization came at the cost of view alignment quality.
+**LeJEPA λ=0.5** showed the highest initial invariance loss among stable conditions (~0.055 at step 100), reflecting the strong SIGReg pressure that initially dominates training and deprioritizes view alignment. The invariance loss then declined to ~0.014 and the gradient ratio stabilized near 0.74 — meaning by the end of training SIGReg's raw gradient was actually weaker than invariance, yet λ=0.5 kept it as the dominant effective contributor. SIGReg loss reached the lowest final value (0.009).
 
-### 3.3 Gradient Ratio Analysis
-
-The gradient ratio plots (rightmost panel above) provide direct evidence for the "guard" dynamic.
-
-For λ=0.1 and λ=0.5, the ratio starts high in the first few thousand steps and then stabilizes at a lower plateau. SIGReg gradients are strong when the distribution is disordered and weaken as it approaches Gaussian — the regularizer is most active when it is most needed.
-
-For λ=0.05, the ratio during the collapse phase (steps 0–4500) oscillates violently between 10² and 10³, then drops to ~12 after escape. For λ=0.01, the ratio never stabilizes, remaining in the 10²–10⁴ range throughout.
-
-The final gradient ratios form a monotone decreasing sequence with λ:
+The final gradient ratios form a monotone decreasing sequence with λ, confirming that higher λ produces stronger regularization pressure at every point in training, not just through explicit weighting:
 
 | Condition | Grad Ratio (final) | Effective SIGReg contribution (after λ) |
 |-----------|-------------------|-----------------------------------------|
@@ -214,9 +228,7 @@ The final gradient ratios form a monotone decreasing sequence with λ:
 | LeJEPA λ=0.1 | 1.40 | ~14% of Inv |
 | LeJEPA λ=0.5 | 0.74 | ~37% of Inv |
 
-Higher λ → stronger regularization pressure at every point in training, not just through the explicit weighting.
-
-### 3.4 Linear Probe Results
+### 3.3 Linear Probe Results
 
 | Condition | SIGReg (final) | Inv Loss (final) | Emb Var (final) | Test Acc |
 |-----------|---------------|-----------------|-----------------|----------|
@@ -226,25 +238,17 @@ Higher λ → stronger regularization pressure at every point in training, not j
 | LeJEPA λ=0.1 | 0.064 | 0.006 | 0.840 | **59.95%** |
 | LeJEPA λ=0.5 | 0.009 | 0.013 | 0.938 | **61.97%** |
 
-LeJEPA λ=0.1 and λ=0.5 both outperform VICReg by 5–7 percentage points. LeJEPA λ=0.05 underperforms VICReg due to the ~4500 steps lost to collapse.
+LeJEPA λ=0.1 and λ=0.5 both outperform VICReg by 5–7 percentage points. LeJEPA λ=0.05 underperforms VICReg due to the ~4500 steps lost to collapse. LeJEPA λ=0.01 achieves random chance, confirming that collapse completely destroys representational utility.
 
-### 3.5 Discussion
+### 3.4 Conclusion
 
-**The dissociation between SIGReg loss and downstream accuracy.**
+**SIGReg loss does not fully predict downstream accuracy.** VICReg achieves the lowest final SIGReg loss (0.011) yet lower test accuracy than LeJEPA λ=0.1 and λ=0.5. The invariance loss explains this: VICReg's invariance loss (0.024) is four times higher than LeJEPA λ=0.1 (0.006) and nearly twice that of λ=0.5 (0.013). The result is embeddings that are well-distributed in shape but insufficiently aligned across views. In this experiment, invariance loss is a stronger predictor of downstream accuracy than SIGReg loss among non-collapsed conditions.
 
-The most striking result is that VICReg achieves the lowest SIGReg loss (0.011) yet lower accuracy than LeJEPA λ=0.1 and λ=0.5. If SIGReg loss fully predicted downstream performance, VICReg should be the best condition. It is not.
+**The λ=0.5 accuracy advantage** is likely a consequence of the limited training budget. Stronger SIGReg pressure accelerates distribution convergence, allowing the backbone to learn more structured features within 20000 steps. Whether this advantage persists at convergence is unknown — λ=0.1's better view alignment may allow it to surpass λ=0.5 given a longer training run.
 
-The explanation is invariance loss. VICReg's invariance loss at the end of training (0.024) is four times higher than LeJEPA λ=0.1 (0.006). VICReg's three-term loss structure creates a competition between its variance, invariance, and covariance terms. The optimizer satisfies all three simultaneously, but this means the invariance term receives less dedicated optimization pressure than in LeJEPA, where invariance has a dedicated (1−λ) weight. The result: VICReg produces embeddings that are well-distributed in shape but poorly aligned across views.
+**The collapse escape at λ=0.05** is visible as a sharp invariance loss spike from 0 to ~0.05 at step ~4500, followed by rapid decline to ~0.005. This spike occurs because embeddings suddenly spread out, making different views distinguishable for the first time. The warmup schedule did not reliably prevent this collapse.
 
-A linear classifier trained on these embeddings sees features that vary considerably within a class (because different views are far apart), reducing its ability to generalize. In this experiment, **invariance loss is a better predictor of downstream accuracy than SIGReg loss**.
-
-**The λ=0.5 accuracy advantage.**
-
-λ=0.5 achieves the highest accuracy despite elevated invariance loss. This is likely a consequence of the limited training budget (20000 steps ≈ 200 epochs). With stronger SIGReg pressure, the distribution converges faster, and the backbone learns more structured features within the available steps. Whether this advantage persists at convergence is unknown — if invariance loss remains elevated at λ=0.5 over a longer run, λ=0.1 may eventually surpass it.
-
-### 3.6 Conclusions
-
-**Lambda behavior zones.**
+These observations map onto four distinct behavioral zones:
 
 | Zone | Lambda | Behavior |
 |------|--------|----------|
@@ -253,23 +257,15 @@ A linear classifier trained on these embeddings sees features that vary consider
 | Stable | λ = 0.1 | No collapse, best view alignment, competitive accuracy |
 | High-reg | λ = 0.5 | Fastest distribution convergence, highest accuracy in this run |
 
-**Core conclusions:**
+LeJEPA outperforms VICReg when λ is large enough to prevent collapse. The 5–7 percentage point advantage at λ=0.1 and λ=0.5 supports the paper's claim that sufficient moment matching produces better representations than 2-moment matching. The gradient ratio confirms the guard dynamic: SIGReg is strongest when the distribution is disordered and recedes as it approaches Gaussian.
 
-LeJEPA with SIGReg outperforms VICReg when λ is large enough to prevent collapse. At λ=0.1 and λ=0.5, the advantage is 5–7 percentage points, supporting the paper's claim that sufficient moment matching produces better representations. The gradient ratio analysis confirms the guard dynamic: SIGReg dominates early and recedes as the distribution approaches Gaussian.
+### 3.5 Limitations and Future Work
 
-However, SIGReg loss alone is not sufficient to predict downstream performance. VICReg achieves the lowest SIGReg loss but intermediate accuracy, because its loss structure leaves view alignment under-optimized. Both distribution quality and view alignment matter.
+**Insufficient training steps.** 20000 steps corresponds to ~200 epochs — well below the 800–1000 epochs at which SSL models typically converge. The λ=0.5 accuracy advantage and the ordering of conditions may reflect convergence speed rather than final performance.
 
-### 3.7 Limitations and Future Work
+**Invariance loss scale confound.** PureSIG's invariance loss (~3) cannot be directly compared to main experiment values (~0.005–0.024) due to the scale effect of emb_var >> 1. L2-normalizing embeddings before computing invariance would enable a fair comparison.
 
-**Insufficient training steps.** 20000 steps corresponds to ~200 epochs — well below the 800–1000 epochs at which SSL models typically converge. The ordering of conditions by test accuracy may reflect convergence speed differences rather than final performance. In particular, the λ=0.5 accuracy advantage may not hold at full convergence.
-
-**Single seed.** Each condition was run once. The stochastic collapse escape at λ=0.05 demonstrates that some conditions are sensitive to the specific gradient trajectory. Without multiple seeds, the variance of results cannot be quantified.
-
-**Dataset resolution.** CIFAR-10's 32×32 images limit feature richness and require the simplified pad-and-crop augmentation. Results may not generalize to higher-resolution benchmarks.
-
-**VICReg internal loss decomposition not tracked.** The variance, invariance, and covariance terms of VICReg were not logged separately. Tracking these would clarify exactly how the three-term competition affects view alignment, enabling a more precise diagnosis of VICReg's higher invariance loss.
-
-**Directions for improvement:** extending training to 50000–100000 steps; running 3+ seeds per condition; adding λ=0.25 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
+**Directions for improvement:** extending training to 50000–100000 steps; adding λ=0.25 to fill the gap between stable and high-regularization zones; logging VICReg's internal terms; testing on STL-10 or ImageNette for higher-resolution validation.
 
 ---
 
