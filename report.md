@@ -1,7 +1,3 @@
-<img width="1126" height="557" alt="image" src="https://github.com/user-attachments/assets/180daf63-8280-428e-a7a9-844365ecfe10" /># Testing the Theoretical Claims of LeJEPA: A Lambda Sweep and VICReg Comparison
-
----
-
 ## 1. Background
 
 ### 1.1 Self-Supervised Learning
