@@ -1,4 +1,4 @@
-# Testing the Theoretical Claims of LeJEPA: A Lambda Sweep and VICReg Comparison
+<img width="1126" height="557" alt="image" src="https://github.com/user-attachments/assets/180daf63-8280-428e-a7a9-844365ecfe10" /># Testing the Theoretical Claims of LeJEPA: A Lambda Sweep and VICReg Comparison
 
 ---
 
@@ -58,7 +58,21 @@ CIFAR-10 is a standard image classification benchmark: 10 classes, 50,000 traini
 
 The 32×32 resolution is a limitation: it constrains the richness of features the encoder can learn and requires a simplified augmentation strategy (pad-and-crop rather than RandomResizedCrop). Results may not generalize to higher-resolution settings.
 
-### 1.6 MiniResNet-18
+### 1.6 Augmentation
+
+Four operations applied independently four times per image to produce V=4 different views
+
+Pad-and-crop: pad 4 pixels on each side to 40×40, then randomly crop back to 32×32. Forces the model to be invariant to the spatial position of objects within the image.
+
+Random horizontal flip: 50% probability of left-right flip. Forces the model to treat mirrored images as semantically equivalent.
+
+Color jitter: randomly adjust brightness, contrast, saturation, and hue, with 20% probability of converting to grayscale. Forces the model to rely on shape and texture rather than absolute color values.
+
+Normalize: subtract CIFAR-10 channel means and divide by standard deviations. Stabilizes gradient magnitudes during training.
+
+The pipeline follows SimCLR (Chen et al. 2020). The core design principle is that two views of the same image should be different enough to make the task non-trivial, but similar enough that the model can still find the correspondence. Augmentations that are too weak allow shortcut solutions; augmentations that are too aggressive destroy the semantic content needed for learning.
+
+### 1.7 MiniResNet-18
 
 MiniResNet-18 is a lightweight ResNet-18 adapted for 32×32 CIFAR-10 input. The architecture:
 
@@ -75,7 +89,7 @@ GlobalAvgPool → (512,)
 
 The model exposes two forward methods: `encode()` returns the 512-dim backbone features used for linear probe; `__call__()` applies the full forward pass including the projection head, used during SSL training.
 
-### 1.7 JAX and Equinox
+### 1.8 JAX and Equinox
 
 **JAX** is a numerical computing library designed for high-performance machine learning research. Its core design principles are relevant to this experiment:
 
@@ -87,9 +101,6 @@ These transforms compose cleanly and require functions to be pure, which motivat
 
 **Equinox** is a JAX-based neural network library that represents models as pytrees of arrays — pure data structures with no hidden state. This makes models composable with all JAX transforms naturally.
 
-### 1.8 AdamW and Warmup Cosine Decay
-
-**AdamW** is Adam with decoupled weight decay. Standard Adam applies weight decay by adding it to the gradient, which interacts with the adaptive learning rate scaling. AdamW applies weight decay directly to the parameters, independent of the gradient, which is the theoretically correct regularization behavior.
 
 **Warmup cosine decay** uses a two-phase learning rate schedule:
 
@@ -99,6 +110,7 @@ Steps 500–20000: cosine decay from peak lr to end lr (1e-5)
 ```
 
 The warmup phase is important for SSL training: in the first steps, embeddings are near-random and gradients are large and unstable. A full learning rate from step 0 can push the model into a collapsed or degenerate state before meaningful gradient information is available. Ramping the learning rate gradually gives the model time to establish a reasonable embedding distribution before committing to large parameter updates. The cosine decay phase allows fine-grained refinement as the model approaches convergence.
+
 
 ---
 
