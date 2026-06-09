@@ -1,3 +1,6 @@
+# Testing the Theoretical Claims of LeJEPA: A Lambda Sweep and VICReg Comparison
+---
+
 ## 1. Background
 
 ### 1.1 Self-Supervised Learning
